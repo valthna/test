@@ -104,6 +104,18 @@ function unwrapArray(parsed: any): any {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Health / diagnostics: GET /api/llm tells whether the function is deployed
+  // and whether the gateway key is visible to it — WITHOUT exposing the value.
+  if (req.method === 'GET') {
+    res.status(200).json({
+      ok: true,
+      endpoint: 'llm',
+      keyConfigured: !!process.env.AI_GATEWAY_API_KEY,
+      model: DEFAULT_MODEL,
+    });
+    return;
+  }
+
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;

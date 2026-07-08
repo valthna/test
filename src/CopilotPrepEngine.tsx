@@ -451,6 +451,7 @@ export default function App() {
   const [currentDossier, setCurrentDossier] = useState<StrategicDossier | null>(null);
   const [isGeneratingDossier, setIsGeneratingDossier] = useState<boolean>(false);
   const [notification, setNotification] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
+  const [aiStatus, setAiStatus] = useState<{ mode: 'unknown' | 'gateway' | 'simulation'; detail?: string }>({ mode: 'unknown' });
 
   const [showAddOppModal, setShowAddOppModal] = useState<boolean>(false);
   const [newOppForm, setNewOppForm] = useState({
@@ -787,14 +788,24 @@ export default function App() {
         })
       });
 
-      if (!resp.ok) throw new Error(`gateway ${resp.status}`);
+      if (!resp.ok) {
+        let reason = `HTTP ${resp.status}`;
+        try {
+          const errBody = await resp.json();
+          if (errBody?.error) reason = `${resp.status} · ${errBody.error}`;
+        } catch { /* non-JSON error body */ }
+        throw new Error(reason);
+      }
       const data = await resp.json();
       if (!data || typeof data.text !== 'string' || !data.text.trim()) {
-        throw new Error('empty gateway response');
+        throw new Error('réponse gateway vide');
       }
+      setAiStatus({ mode: 'gateway' });
       return { text: data.text, sources: Array.isArray(data.sources) ? data.sources : [] };
-    } catch (err) {
-      console.warn('AI Gateway indisponible, repli sur la simulation locale:', err);
+    } catch (err: any) {
+      const detail = String(err?.message || err);
+      setAiStatus({ mode: 'simulation', detail });
+      console.warn('AI Gateway indisponible, repli sur la simulation locale:', detail);
       return simulateFallbackResponse(prompt, systemInstruction, options);
     }
   };
@@ -1478,8 +1489,26 @@ export default function App() {
               <span className="text-[9px] text-emerald-400 font-mono font-semibold block -mt-0.5">GUIDE IA ACTIF</span>
             </div>
           </div>
-          <div className="bg-neutral-800 text-[10px] text-neutral-400 font-mono font-bold px-2 py-0.5 rounded-full border border-neutral-700">
-            {tokens} Cr.
+          <div className="flex items-center gap-1.5">
+            <span
+              title={aiStatus.mode === 'simulation'
+                ? `Repli simulation locale — raison : ${aiStatus.detail || 'inconnue'}`
+                : aiStatus.mode === 'gateway'
+                  ? 'Réponses générées par le Vercel AI Gateway'
+                  : "Statut de l'IA (défini au premier appel)"}
+              className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded-full border ${
+                aiStatus.mode === 'gateway'
+                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                  : aiStatus.mode === 'simulation'
+                    ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                    : 'bg-neutral-800 text-neutral-500 border-neutral-700'
+              }`}
+            >
+              {aiStatus.mode === 'gateway' ? 'IA ✓ Gateway' : aiStatus.mode === 'simulation' ? 'IA ⚠ simulée' : 'IA …'}
+            </span>
+            <div className="bg-neutral-800 text-[10px] text-neutral-400 font-mono font-bold px-2 py-0.5 rounded-full border border-neutral-700">
+              {tokens} Cr.
+            </div>
           </div>
         </div>
 
