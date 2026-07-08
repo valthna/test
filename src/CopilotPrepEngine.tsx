@@ -750,15 +750,53 @@ export default function App() {
     };
   };
 
+  const buildLlmContext = () => ({
+    firstName: onboardingForm.firstName,
+    lastName: onboardingForm.lastName,
+    profileTitle: onboardingForm.profileTitle,
+    cvText: onboardingForm.cvText,
+    pastExperiences: onboardingForm.pastExperiences,
+    expectedSalaryBrut: onboardingForm.expectedSalaryBrut,
+    targetCompany: selectedOpportunity?.companyName,
+    targetRole: selectedOpportunity?.roleTitle
+  });
+
+  // All of the app's intelligence goes through the Vercel AI Gateway via our
+  // /api/llm serverless proxy. If the gateway is not configured (no
+  // AI_GATEWAY_API_KEY) or errors out, we transparently fall back to the local
+  // offline simulation so the product keeps working.
   const callGeminiAPI = async (
     prompt: string,
     systemInstruction: string,
     options: {
       isJSON?: boolean;
       schema?: any;
+      task?: string;
     } = {}
   ) => {
-    return simulateFallbackResponse(prompt, systemInstruction, options);
+    try {
+      const resp = await fetch('/api/llm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          systemInstruction,
+          isJSON: !!options.isJSON,
+          task: options.task,
+          context: buildLlmContext()
+        })
+      });
+
+      if (!resp.ok) throw new Error(`gateway ${resp.status}`);
+      const data = await resp.json();
+      if (!data || typeof data.text !== 'string' || !data.text.trim()) {
+        throw new Error('empty gateway response');
+      }
+      return { text: data.text, sources: Array.isArray(data.sources) ? data.sources : [] };
+    } catch (err) {
+      console.warn('AI Gateway indisponible, repli sur la simulation locale:', err);
+      return simulateFallbackResponse(prompt, systemInstruction, options);
+    }
   };
 
   const triggerProactiveLinkedInScan = async () => {
@@ -775,7 +813,7 @@ export default function App() {
       const response = await callGeminiAPI(
         `Cherche le profil LinkedIn pour "${fullName}" en France. Propose des résultats plausibles ou réels si disponibles, adaptés pour l'industrie de la tech/vente/produit/cosmétique.`,
         "Génère un retour JSON strict.",
-        { isJSON: true }
+        { isJSON: true, task: 'linkedin_search' }
       );
 
       const results = JSON.parse(response.text);
@@ -861,7 +899,7 @@ export default function App() {
     setIsAgentThinking(true);
 
     try {
-      const response = await callGeminiAPI(userText, "Tu es Victor l'Éclaireur, un copilote d'entretien d'élite.");
+      const response = await callGeminiAPI(userText, "Tu es Victor l'Éclaireur, un copilote d'entretien d'élite.", { task: 'chat' });
       addAgentMessage(response.text);
     } catch (error) {
       console.error(error);
@@ -881,10 +919,11 @@ export default function App() {
       const response = await callGeminiAPI(
         `Fais une recherche internet poussée sur l'entreprise "${query}".`,
         "Tu es un éclaireur de recrutement. Génère un retour sous format JSON.",
-        { isJSON: true }
+        { isJSON: true, task: 'company_search' }
       );
 
-      const parsedData: CompanyWiki = {
+      // Sensible defaults, then overlay whatever the AI Gateway returned.
+      const defaults: CompanyWiki = {
         id: query.toLowerCase().replace(/\s+/g, '-'),
         name: query,
         city: "Paris",
@@ -912,6 +951,26 @@ export default function App() {
         recentMilestones: ["Consolidation de la direction produit européenne"],
         realRealityReport: "L'onboarding est rapide mais autonome. L'ambiance est positive et respectueuse des horaires individuels.",
         activeJobs: ["Product Owner Senior - Core Banking", "Product Manager - API Platform", "Consultant Technique Senior"]
+      };
+
+      let aiData: Partial<CompanyWiki> = {};
+      try {
+        const parsed = JSON.parse(response.text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) aiData = parsed;
+      } catch {
+        /* keep defaults if the gateway output isn't parseable */
+      }
+
+      const parsedData: CompanyWiki = {
+        ...defaults,
+        ...aiData,
+        id: defaults.id,
+        name: query,
+        perks: { ...defaults.perks, ...(aiData.perks || {}) },
+        tools: aiData.tools?.length ? aiData.tools : defaults.tools,
+        recruitmentProcessSteps: aiData.recruitmentProcessSteps?.length ? aiData.recruitmentProcessSteps : defaults.recruitmentProcessSteps,
+        recentMilestones: aiData.recentMilestones?.length ? aiData.recentMilestones : defaults.recentMilestones,
+        activeJobs: aiData.activeJobs?.length ? aiData.activeJobs : defaults.activeJobs
       };
 
       setCompanies(prev => {
@@ -1112,7 +1171,8 @@ export default function App() {
     try {
       const res = await callGeminiAPI(
         `Exercice sélectionné : ${exeId}. Contexte : ${contextText}. Donne-moi l'angle d'attaque pour réussir.`,
-        "Donne une recommandation tactique pour aider le candidat sans donner la réponse."
+        "Donne une recommandation tactique pour aider le candidat sans donner la réponse.",
+        { task: 'exercise_hint' }
       );
       setExerciceAnswers(prev => ({
         ...prev,
@@ -1136,7 +1196,7 @@ export default function App() {
       const res = await callGeminiAPI(
         `Exercice ID: ${exeId}. Proposition du candidat: "${exerciceAnswers[exeId].userProposal}".`,
         "Analyse la réponse selon le framework STAR.",
-        { isJSON: true }
+        { isJSON: true, task: 'exercise_eval' }
       );
       const data = JSON.parse(res.text);
 
@@ -1243,7 +1303,7 @@ export default function App() {
     `;
 
     try {
-      const response = await callGeminiAPI(promptText, "Bâtis un rapport de combat d'entretien.", { isJSON: true });
+      const response = await callGeminiAPI(promptText, "Bâtis un rapport de combat d'entretien.", { isJSON: true, task: 'dossier' });
 
       const parsedDossier: StrategicDossier = JSON.parse(response.text);
       setCurrentDossier(parsedDossier);
@@ -1294,9 +1354,9 @@ export default function App() {
 
     try {
       const response = await callGeminiAPI(
-        `Nouvelle réponse du candidat : "${userAns}"`,
+        `Tu es l'interlocuteur "${selectedCoachRole}" en entretien. Nouvelle réponse du candidat : "${userAns}"`,
         "Analyse la réponse selon la grille STAR.",
-        { isJSON: true }
+        { isJSON: true, task: 'coach_eval' }
       );
 
       const data = JSON.parse(response.text);
@@ -1343,7 +1403,8 @@ export default function App() {
     try {
       const res = await callGeminiAPI(
         `Ressenti de l'utilisateur suite à son entretien d'étape : "${userAns}"`,
-        "Tu es Victor l'Éclaireur, le coach d'analyse post-entretien."
+        "Tu es Victor l'Éclaireur, le coach d'analyse post-entretien.",
+        { task: 'debrief' }
       );
 
       setPostInterviewDebriefSession(prev => {
@@ -3589,21 +3650,25 @@ export default function App() {
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fadeIn">
           <div className="bg-white border border-neutral-200 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4">
             <div className="border-b pb-3">
-              <h3 className="text-sm font-black text-neutral-950">Accès API Gemini</h3>
-              <p className="text-xs text-neutral-400 mt-0.5">Le prototype utilise par défaut les accès de simulation de combat hors connexion.</p>
+              <h3 className="text-sm font-black text-neutral-950">Intelligence : Vercel AI Gateway</h3>
+              <p className="text-xs text-neutral-400 mt-0.5">Toute l'intelligence de l'app (recherche, dossiers, coach, exercices) passe par le Vercel AI Gateway.</p>
             </div>
             <div className="space-y-3">
-              <label className="block text-xs font-bold text-neutral-600">Clé API Personnelle Gemini (Optionnel)</label>
-              <input 
-                type="password"
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder="Laissez vide pour utiliser la simulation"
-                className="w-full p-2.5 bg-neutral-50 border border-neutral-200 rounded-xl text-xs focus:outline-none font-mono"
-              />
-              <p className="text-[10px] text-neutral-500 leading-relaxed">
-                Les appels sont transmis de manière transparente au modèle <span className="font-semibold text-neutral-800">gemini-3-flash-preview</span>.
-              </p>
+              <div className="bg-neutral-50 border border-neutral-200 rounded-xl p-3 space-y-2 text-[11px] text-neutral-600 leading-relaxed">
+                <p className="font-semibold text-neutral-800">Configuration sécurisée côté serveur</p>
+                <p>
+                  Les appels LLM sont relayés par la fonction serverless <span className="font-mono font-semibold text-neutral-800">/api/llm</span>.
+                  La clé n'est jamais exposée au navigateur : elle vit dans la variable d'environnement Vercel
+                  <span className="font-mono font-semibold text-neutral-800"> AI_GATEWAY_API_KEY</span>.
+                </p>
+                <p>
+                  Modèle configurable via <span className="font-mono font-semibold text-neutral-800">AI_GATEWAY_MODEL</span>
+                  {' '}(défaut <span className="font-mono">openai/gpt-4o-mini</span>).
+                </p>
+                <p className="text-neutral-500">
+                  Sans clé configurée, l'app bascule automatiquement sur une simulation locale afin de rester fonctionnelle.
+                </p>
+              </div>
             </div>
             <div className="flex justify-end gap-2 pt-3 border-t">
               <button 
