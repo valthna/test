@@ -165,12 +165,137 @@ async function callGateway(
   };
 }
 
+interface TaskBody {
+  prompt?: string;
+  systemInstruction?: string;
+  isJSON?: boolean;
+  task?: string;
+  context?: any;
+}
+
+// Canned request used by GET /api/llm?selftest=1 to exercise the full dossier
+// pipeline (gateway -> json_object -> unwrap) end-to-end and report structure.
+const SELFTEST_DOSSIER_BODY: TaskBody = {
+  task: 'dossier',
+  isJSON: true,
+  systemInstruction: "Bâtis un rapport de combat d'entretien.",
+  prompt:
+    '=== ENTREPRISE CIBLE ===\nNom: Stripe\nPoste: Enterprise Account Executive - SaaS Fintech\n' +
+    'Description: closing de deals SaaS complexes à cycles longs, interlocuteurs C-level, Salesforce, MEDDPICC.',
+  context: {
+    firstName: 'Valentin',
+    lastName: 'Navaron',
+    profileTitle: 'Enterprise Account Executive',
+    cvText: 'Account Executive SaaS avec expérience de closing complexe et négociation C-level.',
+    expectedSalaryBrut: 65000,
+    targetCompany: 'Stripe',
+    targetRole: 'Enterprise Account Executive - SaaS Fintech',
+  },
+};
+
+// Runs one task through the gateway and returns an HTTP status + JSON payload.
+// Shared by the POST endpoint and the self-test so they can never diverge.
+async function executeTask(apiKey: string, body: TaskBody): Promise<{ status: number; payload: any }> {
+  const prompt = (body.prompt || '').toString();
+  const task = (body.task || '').toString();
+  const wantsJson = !!body.isJSON || task in JSON_TASKS;
+
+  const systemParts = [BASE_PERSONA];
+  if (body.systemInstruction) systemParts.push(body.systemInstruction);
+  if (task in JSON_TASKS) systemParts.push(JSON_TASKS[task]);
+  if (task in TEXT_TASKS) systemParts.push(TEXT_TASKS[task]);
+  if (wantsJson) {
+    systemParts.push(
+      'IMPORTANT : réponds UNIQUEMENT avec du JSON valide correspondant exactement au schéma demandé. ' +
+        "Toutes les clés doivent être au niveau racine (aucune clé d'emballage). " +
+        'Pas de texte autour, pas de balises Markdown, pas de commentaires.'
+    );
+  }
+
+  const userContent = prompt + buildContextBlock(body.context);
+
+  try {
+    const r = await callGateway(
+      apiKey,
+      [
+        { role: 'system', content: systemParts.join('\n\n') },
+        { role: 'user', content: userContent },
+      ],
+      { json: wantsJson, maxTokens: MAX_TOKENS[task] }
+    );
+
+    if (!r.ok) {
+      console.error(`[llm] task=${task} gateway ${r.status}: ${r.error}`);
+      return { status: 502, payload: { error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) } };
+    }
+
+    let text = r.content;
+    console.log(`[llm] task=${task} finish=${r.finishReason} len=${text.length}`);
+
+    if (r.finishReason === 'length') {
+      console.error(`[llm] task=${task} truncated (max_tokens). Increase MAX_TOKENS.`);
+      return { status: 502, payload: { error: 'Gateway response truncated', detail: `finish_reason=length len=${text.length}` } };
+    }
+
+    if (wantsJson) {
+      try {
+        let parsed = JSON.parse(text);
+        parsed = task === 'linkedin_search' ? unwrapArray(parsed) : unwrapObject(parsed, task);
+        text = JSON.stringify(parsed);
+      } catch {
+        console.error(`[llm] task=${task} JSON parse failed`);
+        return { status: 502, payload: { error: 'Gateway returned non-JSON', detail: text.slice(0, 200) } };
+      }
+    }
+
+    return { status: 200, payload: { text, sources: [] } };
+  } catch (err: any) {
+    console.error(`[llm] task=${task} request failed:`, err);
+    return { status: 502, payload: { error: 'Gateway request failed', detail: String(err?.message || err).slice(0, 300) } };
+  }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const apiKey = process.env.AI_GATEWAY_API_KEY;
 
   // Health / diagnostics.
   if (req.method === 'GET') {
     const base = { ok: true, endpoint: 'llm', keyConfigured: !!apiKey, model: DEFAULT_MODEL };
+
+    // Full dossier pipeline self-test: proves structured output renders filled.
+    if (req.query.selftest) {
+      if (!apiKey) {
+        res.status(200).json({ ...base, selftest: { tested: false, reason: 'no key' } });
+        return;
+      }
+      const { status, payload } = await executeTask(apiKey, SELFTEST_DOSSIER_BODY);
+      let diag: any = { tested: true, httpStatus: status };
+      if (payload?.text) {
+        try {
+          const p = JSON.parse(payload.text);
+          diag = {
+            ...diag,
+            parsedOk: true,
+            topLevelKeys: Object.keys(p),
+            hasCompanyReport: !!(p.companyReport && (p.companyReport.marketState || p.companyReport.financialHealth)),
+            matchScore: p.matchScore,
+            missionRecapLen: (p.missionRecap || '').length,
+            pitchLen: (p.sixtySecPitch || '').length,
+            gapsCount: Array.isArray(p.gaps) ? p.gaps.length : 0,
+            blindSpotsCompanyCount: Array.isArray(p.blindSpotsCompany) ? p.blindSpotsCompany.length : 0,
+            useCaseCount: Array.isArray(p.useCaseScenario) ? p.useCaseScenario.length : 0,
+            negotiationRange: p.negotiationGuide?.suggestedRange,
+          };
+        } catch {
+          diag = { ...diag, parsedOk: false, sample: String(payload.text).slice(0, 200) };
+        }
+      } else {
+        diag = { ...diag, error: payload?.error, detail: payload?.detail };
+      }
+      res.status(200).json({ ...base, selftest: diag });
+      return;
+    }
+
     if (!req.query.ping) {
       res.status(200).json(base);
       return;
@@ -209,73 +334,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const body = (req.body || {}) as {
-    prompt?: string;
-    systemInstruction?: string;
-    isJSON?: boolean;
-    task?: string;
-    context?: any;
-  };
-
-  const prompt = (body.prompt || '').toString();
-  const task = (body.task || '').toString();
-  const wantsJson = !!body.isJSON || task in JSON_TASKS;
-
-  const systemParts = [BASE_PERSONA];
-  if (body.systemInstruction) systemParts.push(body.systemInstruction);
-  if (task in JSON_TASKS) systemParts.push(JSON_TASKS[task]);
-  if (task in TEXT_TASKS) systemParts.push(TEXT_TASKS[task]);
-  if (wantsJson) {
-    systemParts.push(
-      'IMPORTANT : réponds UNIQUEMENT avec du JSON valide correspondant exactement au schéma demandé. ' +
-        "Toutes les clés doivent être au niveau racine (aucune clé d'emballage). " +
-        'Pas de texte autour, pas de balises Markdown, pas de commentaires.'
-    );
-  }
-
-  const userContent = prompt + buildContextBlock(body.context);
-
-  try {
-    const r = await callGateway(
-      apiKey,
-      [
-        { role: 'system', content: systemParts.join('\n\n') },
-        { role: 'user', content: userContent },
-      ],
-      { json: wantsJson, maxTokens: MAX_TOKENS[task] }
-    );
-
-    if (!r.ok) {
-      console.error(`[llm] task=${task} gateway ${r.status}: ${r.error}`);
-      res.status(502).json({ error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) });
-      return;
-    }
-
-    let text = r.content;
-    console.log(`[llm] task=${task} finish=${r.finishReason} len=${text.length}`);
-
-    if (r.finishReason === 'length') {
-      // Truncated -> JSON would be invalid; make the client fall back cleanly.
-      console.error(`[llm] task=${task} truncated (max_tokens). Increase MAX_TOKENS.`);
-      res.status(502).json({ error: 'Gateway response truncated', detail: `finish_reason=length len=${text.length}` });
-      return;
-    }
-
-    if (wantsJson) {
-      try {
-        let parsed = JSON.parse(text);
-        parsed = task === 'linkedin_search' ? unwrapArray(parsed) : unwrapObject(parsed, task);
-        text = JSON.stringify(parsed);
-      } catch (e) {
-        console.error(`[llm] task=${task} JSON parse failed`);
-        res.status(502).json({ error: 'Gateway returned non-JSON', detail: text.slice(0, 200) });
-        return;
-      }
-    }
-
-    res.status(200).json({ text, sources: [] });
-  } catch (err: any) {
-    console.error(`[llm] task=${task} request failed:`, err);
-    res.status(502).json({ error: 'Gateway request failed', detail: String(err?.message || err).slice(0, 300) });
-  }
+  const { status, payload } = await executeTask(apiKey, (req.body || {}) as TaskBody);
+  res.status(status).json(payload);
 }
