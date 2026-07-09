@@ -193,9 +193,22 @@ const SELFTEST_DOSSIER_BODY: TaskBody = {
   },
 };
 
+function isThinDossier(p: any): boolean {
+  if (!p || typeof p !== 'object') return true;
+  const hasCompany = !!(p.companyReport && (p.companyReport.marketState || p.companyReport.financialHealth));
+  const hasPitch = typeof p.sixtySecPitch === 'string' && p.sixtySecPitch.trim().length > 0;
+  const hasMission = typeof p.missionRecap === 'string' && p.missionRecap.trim().length > 0;
+  const hasGaps = Array.isArray(p.gaps) && p.gaps.length > 0;
+  return !(hasCompany && hasPitch && hasMission && hasGaps);
+}
+
 // Runs one task through the gateway and returns an HTTP status + JSON payload.
 // Shared by the POST endpoint and the self-test so they can never diverge.
-async function executeTask(apiKey: string, body: TaskBody): Promise<{ status: number; payload: any }> {
+async function executeTask(
+  apiKey: string,
+  body: TaskBody,
+  opts: { debug?: boolean } = {}
+): Promise<{ status: number; payload: any }> {
   const prompt = (body.prompt || '').toString();
   const task = (body.task || '').toString();
   const wantsJson = !!body.isJSON || task in JSON_TASKS;
@@ -207,51 +220,78 @@ async function executeTask(apiKey: string, body: TaskBody): Promise<{ status: nu
   if (wantsJson) {
     systemParts.push(
       'IMPORTANT : réponds UNIQUEMENT avec du JSON valide correspondant exactement au schéma demandé. ' +
-        "Toutes les clés doivent être au niveau racine (aucune clé d'emballage). " +
+        "Toutes les clés doivent être au niveau racine (aucune clé d'emballage), et CHAQUE clé doit contenir du contenu concret (jamais de chaîne vide). " +
         'Pas de texte autour, pas de balises Markdown, pas de commentaires.'
     );
   }
 
   const userContent = prompt + buildContextBlock(body.context);
+  const debug: any = opts.debug ? {} : undefined;
 
-  try {
+  // One gateway round-trip + parse/normalize. Returns the parsed object (or null).
+  async function attempt(extraSystem?: string): Promise<
+    | { ok: true; text: string; parsed: any; raw: string; finish: string }
+    | { ok: false; status: number; error: string; detail: string; raw?: string }
+  > {
+    const sys = extraSystem ? `${systemParts.join('\n\n')}\n\n${extraSystem}` : systemParts.join('\n\n');
     const r = await callGateway(
       apiKey,
       [
-        { role: 'system', content: systemParts.join('\n\n') },
+        { role: 'system', content: sys },
         { role: 'user', content: userContent },
       ],
       { json: wantsJson, maxTokens: MAX_TOKENS[task] }
     );
-
     if (!r.ok) {
       console.error(`[llm] task=${task} gateway ${r.status}: ${r.error}`);
-      return { status: 502, payload: { error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) } };
+      return { ok: false, status: 502, error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) };
     }
-
-    let text = r.content;
-    console.log(`[llm] task=${task} finish=${r.finishReason} len=${text.length}`);
-
+    const raw = r.content;
+    console.log(`[llm] task=${task} finish=${r.finishReason} len=${raw.length}`);
     if (r.finishReason === 'length') {
-      console.error(`[llm] task=${task} truncated (max_tokens). Increase MAX_TOKENS.`);
-      return { status: 502, payload: { error: 'Gateway response truncated', detail: `finish_reason=length len=${text.length}` } };
+      console.error(`[llm] task=${task} truncated (max_tokens=${MAX_TOKENS[task] ?? 1600}).`);
+      return { ok: false, status: 502, error: 'Gateway response truncated', detail: `finish_reason=length len=${raw.length}`, raw };
     }
+    if (!wantsJson) return { ok: true, text: raw, parsed: null, raw, finish: r.finishReason };
+    try {
+      let parsed = JSON.parse(raw);
+      parsed = task === 'linkedin_search' ? unwrapArray(parsed) : unwrapObject(parsed, task);
+      return { ok: true, text: JSON.stringify(parsed), parsed, raw, finish: r.finishReason };
+    } catch {
+      console.error(`[llm] task=${task} JSON parse failed`);
+      return { ok: false, status: 502, error: 'Gateway returned non-JSON', detail: raw.slice(0, 200), raw };
+    }
+  }
 
-    if (wantsJson) {
-      try {
-        let parsed = JSON.parse(text);
-        parsed = task === 'linkedin_search' ? unwrapArray(parsed) : unwrapObject(parsed, task);
-        text = JSON.stringify(parsed);
-      } catch {
-        console.error(`[llm] task=${task} JSON parse failed`);
-        return { status: 502, payload: { error: 'Gateway returned non-JSON', detail: text.slice(0, 200) } };
+  try {
+    let res = await attempt();
+    if (debug && res.ok) { debug.rawSample = res.raw.slice(0, 1500); debug.finish = res.finish; }
+    if (debug && !res.ok) { debug.error = res.error; debug.rawSample = (res.raw || '').slice(0, 1500); }
+
+    // If the dossier came back structurally empty, retry once, harder.
+    if (res.ok && task === 'dossier' && isThinDossier(res.parsed)) {
+      console.error(`[llm] task=dossier thin result, retrying. keys=${Object.keys(res.parsed || {}).join(',')}`);
+      if (debug) { debug.retried = true; debug.firstKeys = Object.keys(res.parsed || {}); }
+      const retry = await attempt(
+        'Ta réponse précédente était incomplète. Remplis IMPÉRATIVEMENT chaque clé avec du contenu détaillé et concret : ' +
+          'companyReport.financialHealth, companyReport.marketState, companyReport.recentNews, matchScore (nombre), missionRecap (paragraphe), ' +
+          'au moins 2 gaps, au moins 2 blindSpotsCompany, sixtySecPitch (paragraphe), negotiationGuide.suggestedRange + coreArguments, useCaseScenario (au moins 1).'
+      );
+      if (retry.ok && !isThinDossier(retry.parsed)) {
+        res = retry;
+        if (debug) { debug.retrySucceeded = true; debug.rawSample = retry.raw.slice(0, 1500); }
+      } else if (debug) {
+        debug.retrySucceeded = false;
       }
     }
 
-    return { status: 200, payload: { text, sources: [] } };
+    if (!res.ok) {
+      return { status: res.status, payload: { error: res.error, detail: res.detail, ...(debug ? { debug } : {}) } };
+    }
+    return { status: 200, payload: { text: res.text, sources: [], ...(debug ? { debug } : {}) } };
   } catch (err: any) {
     console.error(`[llm] task=${task} request failed:`, err);
-    return { status: 502, payload: { error: 'Gateway request failed', detail: String(err?.message || err).slice(0, 300) } };
+    return { status: 502, payload: { error: 'Gateway request failed', detail: String(err?.message || err).slice(0, 300), ...(debug ? { debug } : {}) } };
   }
 }
 
@@ -268,8 +308,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         res.status(200).json({ ...base, selftest: { tested: false, reason: 'no key' } });
         return;
       }
-      const { status, payload } = await executeTask(apiKey, SELFTEST_DOSSIER_BODY);
-      let diag: any = { tested: true, httpStatus: status };
+      const { status, payload } = await executeTask(apiKey, SELFTEST_DOSSIER_BODY, { debug: true });
+      let diag: any = { tested: true, httpStatus: status, debug: payload?.debug };
       if (payload?.text) {
         try {
           const p = JSON.parse(payload.text);
