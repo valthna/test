@@ -1,0 +1,24 @@
+name: verify-llm
+# Probes the deployed /api/llm diagnostics from a GitHub runner and prints the
+# raw responses to the job log (so they can be read back). Does not fail on
+# non-200 — the body is what we want to inspect.
+on:
+  push:
+    branches: [main, claude/job-search-onboarding-prep-84uu3w]
+    paths: ['.github/workflows/verify-llm.yml']
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping (gateway live test)
+        run: |
+          echo "=== PING ==="
+          curl -sS -w "\n---HTTP %{http_code}---\n" \
+            "https://test-five-silk-54.vercel.app/api/llm?ping=1" || true
+      - name: selftest (full dossier pipeline)
+        run: |
+          echo "=== SELFTEST ==="
+          curl -sS -w "\n---HTTP %{http_code}---\n" \
+            "https://test-five-silk-54.vercel.app/api/llm?selftest=1" || true
