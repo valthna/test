@@ -113,7 +113,7 @@ function buildContextBlock(context: any): string {
   return lines.length ? `\n\n=== CONTEXTE CANDIDAT ===\n${lines.join('\n')}` : '';
 }
 
-function unwrapArray(parsed: any): any {
+export function unwrapArray(parsed: any): any {
   if (Array.isArray(parsed)) return parsed;
   if (parsed && typeof parsed === 'object') {
     for (const key of ['results', 'items', 'data', 'profiles', 'list']) {
@@ -124,7 +124,7 @@ function unwrapArray(parsed: any): any {
 }
 
 // If the model wrapped the payload under a top-level key, dig it back out.
-function unwrapObject(parsed: any, task: string): any {
+export function unwrapObject(parsed: any, task: string): any {
   const expected = EXPECTED_KEYS[task];
   if (!expected || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
   if (expected.some((k) => k in parsed)) return parsed;
