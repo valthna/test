@@ -13,6 +13,11 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
  *                                     "anthropic/claude-3.5-haiku",
  *                                     "google/gemini-2.0-flash"
  *
+ * Diagnostics:
+ *   GET /api/llm          -> { ok, keyConfigured, model }
+ *   GET /api/llm?ping=1   -> also performs a tiny live gateway call and
+ *                            reports the real status + a sample of the output.
+ *
  * If the key is missing or the gateway errors, the endpoint responds with a
  * non-2xx status and the client transparently falls back to its local
  * offline simulation, so the product keeps working.
@@ -38,7 +43,7 @@ const JSON_TASKS: Record<string, string> = {
     '"title": string (intitulé de poste + entreprise), "avatar": string (UN SEUL emoji représentatif du métier), ' +
     '"location": string ("Ville, Pays") }.',
   company_search:
-    "Renvoie un objet JSON décrivant l'entreprise recherchée avec EXACTEMENT ces clés : " +
+    "Renvoie DIRECTEMENT (au niveau racine, sans clé d'emballage) un objet JSON décrivant l'entreprise recherchée avec EXACTEMENT ces clés : " +
     'city (string), country (string), isSubsidiary (boolean), baseSalaryAvg (number : salaire brut annuel € moyen réaliste pour le poste/secteur), ' +
     'baseSalaryType ("cadre" | "non-cadre"), variablePay (string), ' +
     'perks (objet { greenMobility, ticketsResto, ce, rtt, participation, workPhone : booleans, mutuelleName : string }), ' +
@@ -47,24 +52,24 @@ const JSON_TASKS: Record<string, string> = {
     'valueProposition (string), recentMilestones (array de strings), realRealityReport (string : ce qui attend vraiment au quotidien), ' +
     "activeJobs (array d'intitulés de postes ouverts plausibles chez cette entreprise).",
   dossier:
-    'Renvoie un objet JSON "dossier de combat" avec EXACTEMENT ces clés : ' +
-    'companyReport (objet { financialHealth, marketState, recentNews : strings }), ' +
+    "Renvoie DIRECTEMENT (au niveau racine de l'objet JSON, SANS aucune clé d'emballage comme \"dossier\" ou \"result\") un objet avec EXACTEMENT ces clés, toutes remplies avec du contenu concret et personnalisé : " +
+    'companyReport (objet { financialHealth, marketState, recentNews : strings non vides }), ' +
     'matchScore (number 0-100 : compatibilité entre le CV/profil du candidat et l\'offre, basée sur les mots-clés ET la profondeur d\'expérience/expertise), ' +
-    'missionRecap (string : le vrai quotidien du poste au-delà de l\'annonce), ' +
-    'gaps (array de { skill, defense, recommendedTraining }), ' +
+    'missionRecap (string non vide : le vrai quotidien du poste au-delà de l\'annonce), ' +
+    'gaps (array non vide de { skill, defense, recommendedTraining }), ' +
     'blindSpotsJob (array de strings), ' +
-    'blindSpotsCompany (array de { issue, expertQuestion } : failles de structure déduites permettant de poser des questions stratégiques), ' +
-    'sixtySecPitch (string : pitch de 60 secondes personnalisé au candidat), ' +
+    'blindSpotsCompany (array non vide de { issue, expertQuestion } : failles de structure permettant de poser des questions stratégiques), ' +
+    'sixtySecPitch (string non vide : pitch de 60 secondes personnalisé au candidat), ' +
     'negotiationGuide (objet { suggestedRange : string contenant un nombre en € brut annuel, coreArguments : array de strings }), ' +
     'interviewerQuestions (array de { roleType : "rh"|"manager"|"cto"|"peer", question, answerStrategy }), ' +
     'useCaseScenario (array de 1 à 3 { id : "exe-1"/"exe-2"/"exe-3", title, description, expectedDeliverable, proTips }).',
   coach_eval:
-    'Tu joues le rôle de l\'interlocuteur en entretien puis tu analyses la réponse du candidat. Renvoie un objet JSON avec EXACTEMENT : ' +
+    'Tu joues le rôle de l\'interlocuteur en entretien puis tu analyses la réponse du candidat. Renvoie DIRECTEMENT un objet JSON avec EXACTEMENT : ' +
     'rating ("good" | "average" | "poor"), critique (string : analyse de la réponse selon le framework STAR), ' +
     'optimizedResponse (string : reformulation d\'élite de la réponse du candidat), ' +
     'nextInterviewerQuestion (string : la question suivante que tu poses en tant qu\'interlocuteur).',
   exercise_eval:
-    'Renvoie un objet JSON évaluant la proposition du candidat à un cas pratique, avec EXACTEMENT : ' +
+    'Renvoie DIRECTEMENT un objet JSON évaluant la proposition du candidat à un cas pratique, avec EXACTEMENT : ' +
     'score (number 0-100), critique (string), improvements (array de strings), proVersion (string : la version d\'excellence de la réponse).',
 };
 
@@ -76,6 +81,21 @@ const TEXT_TASKS: Record<string, string> = {
     'du recruteur, pose une question de relance pertinente et donne un conseil concret.',
   exercise_hint:
     "Donne un indice tactique (angle d'attaque) pour réussir le cas pratique SANS donner la réponse complète.",
+};
+
+// Expected top-level keys per object task — used to detect & unwrap a model
+// that nested the payload under a wrapper key (e.g. { "dossier": {...} }).
+const EXPECTED_KEYS: Record<string, string[]> = {
+  dossier: ['companyReport', 'matchScore', 'missionRecap', 'sixtySecPitch', 'negotiationGuide'],
+  company_search: ['city', 'baseSalaryAvg', 'tools', 'realRealityReport'],
+  coach_eval: ['rating', 'critique', 'nextInterviewerQuestion'],
+  exercise_eval: ['score', 'critique', 'improvements'],
+};
+
+// Bigger structures need a bigger budget or json_object mode truncates them.
+const MAX_TOKENS: Record<string, number> = {
+  dossier: 4000,
+  company_search: 2500,
 };
 
 function buildContextBlock(context: any): string {
@@ -103,16 +123,78 @@ function unwrapArray(parsed: any): any {
   return parsed;
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Health / diagnostics: GET /api/llm tells whether the function is deployed
-  // and whether the gateway key is visible to it — WITHOUT exposing the value.
-  if (req.method === 'GET') {
-    res.status(200).json({
-      ok: true,
-      endpoint: 'llm',
-      keyConfigured: !!process.env.AI_GATEWAY_API_KEY,
+// If the model wrapped the payload under a top-level key, dig it back out.
+function unwrapObject(parsed: any, task: string): any {
+  const expected = EXPECTED_KEYS[task];
+  if (!expected || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+  if (expected.some((k) => k in parsed)) return parsed;
+  for (const key of Object.keys(parsed)) {
+    const v = parsed[key];
+    if (v && typeof v === 'object' && !Array.isArray(v) && expected.some((k) => k in v)) return v;
+  }
+  return parsed;
+}
+
+async function callGateway(
+  apiKey: string,
+  messages: Array<{ role: string; content: string }>,
+  opts: { json?: boolean; maxTokens?: number; temperature?: number } = {}
+): Promise<{ ok: boolean; status: number; content: string; finishReason: string; error?: string }> {
+  const resp = await fetch(GATEWAY_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
       model: DEFAULT_MODEL,
-    });
+      temperature: opts.temperature ?? (opts.json ? 0.5 : 0.7),
+      max_tokens: opts.maxTokens ?? 1600,
+      ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
+      messages,
+    }),
+  });
+
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    return { ok: false, status: resp.status, content: '', finishReason: '', error: detail.slice(0, 600) };
+  }
+  const data = await resp.json();
+  return {
+    ok: true,
+    status: resp.status,
+    content: data?.choices?.[0]?.message?.content ?? '',
+    finishReason: data?.choices?.[0]?.finish_reason ?? '',
+  };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const apiKey = process.env.AI_GATEWAY_API_KEY;
+
+  // Health / diagnostics.
+  if (req.method === 'GET') {
+    const base = { ok: true, endpoint: 'llm', keyConfigured: !!apiKey, model: DEFAULT_MODEL };
+    if (!req.query.ping) {
+      res.status(200).json(base);
+      return;
+    }
+    if (!apiKey) {
+      res.status(200).json({ ...base, gateway: { tested: false, reason: 'no key' } });
+      return;
+    }
+    try {
+      const r = await callGateway(
+        apiKey,
+        [
+          { role: 'system', content: 'Réponds exactement le mot: pong' },
+          { role: 'user', content: 'ping' },
+        ],
+        { maxTokens: 20 }
+      );
+      res.status(200).json({
+        ...base,
+        gateway: { tested: true, ok: r.ok, status: r.status, sample: (r.content || r.error || '').slice(0, 200), finishReason: r.finishReason },
+      });
+    } catch (err: any) {
+      res.status(200).json({ ...base, gateway: { tested: true, ok: false, error: String(err?.message || err).slice(0, 200) } });
+    }
     return;
   }
 
@@ -121,7 +203,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const apiKey = process.env.AI_GATEWAY_API_KEY;
   if (!apiKey) {
     // Not configured -> tell the client to use its local simulation.
     res.status(501).json({ error: 'AI_GATEWAY_API_KEY not configured' });
@@ -147,6 +228,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (wantsJson) {
     systemParts.push(
       'IMPORTANT : réponds UNIQUEMENT avec du JSON valide correspondant exactement au schéma demandé. ' +
+        "Toutes les clés doivent être au niveau racine (aucune clé d'emballage). " +
         'Pas de texte autour, pas de balises Markdown, pas de commentaires.'
     );
   }
@@ -154,45 +236,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const userContent = prompt + buildContextBlock(body.context);
 
   try {
-    const gwResp = await fetch(GATEWAY_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: DEFAULT_MODEL,
-        temperature: wantsJson ? 0.5 : 0.7,
-        max_tokens: 1600,
-        ...(wantsJson ? { response_format: { type: 'json_object' } } : {}),
-        messages: [
-          { role: 'system', content: systemParts.join('\n\n') },
-          { role: 'user', content: userContent },
-        ],
-      }),
-    });
+    const r = await callGateway(
+      apiKey,
+      [
+        { role: 'system', content: systemParts.join('\n\n') },
+        { role: 'user', content: userContent },
+      ],
+      { json: wantsJson, maxTokens: MAX_TOKENS[task] }
+    );
 
-    if (!gwResp.ok) {
-      const detail = await gwResp.text().catch(() => '');
-      res.status(502).json({ error: `Gateway error ${gwResp.status}`, detail: detail.slice(0, 500) });
+    if (!r.ok) {
+      console.error(`[llm] task=${task} gateway ${r.status}: ${r.error}`);
+      res.status(502).json({ error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) });
       return;
     }
 
-    const data = await gwResp.json();
-    let text: string = data?.choices?.[0]?.message?.content ?? '';
+    let text = r.content;
+    console.log(`[llm] task=${task} finish=${r.finishReason} len=${text.length}`);
 
-    // For array-shaped tasks the client expects a top-level JSON array, but the
-    // gateway's json_object mode returns an object, so normalize.
-    if (task === 'linkedin_search') {
+    if (r.finishReason === 'length') {
+      // Truncated -> JSON would be invalid; make the client fall back cleanly.
+      console.error(`[llm] task=${task} truncated (max_tokens). Increase MAX_TOKENS.`);
+      res.status(502).json({ error: 'Gateway response truncated', detail: `finish_reason=length len=${text.length}` });
+      return;
+    }
+
+    if (wantsJson) {
       try {
-        text = JSON.stringify(unwrapArray(JSON.parse(text)));
-      } catch {
-        /* leave as-is; client will fall back on parse error */
+        let parsed = JSON.parse(text);
+        parsed = task === 'linkedin_search' ? unwrapArray(parsed) : unwrapObject(parsed, task);
+        text = JSON.stringify(parsed);
+      } catch (e) {
+        console.error(`[llm] task=${task} JSON parse failed`);
+        res.status(502).json({ error: 'Gateway returned non-JSON', detail: text.slice(0, 200) });
+        return;
       }
     }
 
     res.status(200).json({ text, sources: [] });
   } catch (err: any) {
+    console.error(`[llm] task=${task} request failed:`, err);
     res.status(502).json({ error: 'Gateway request failed', detail: String(err?.message || err).slice(0, 300) });
   }
 }
