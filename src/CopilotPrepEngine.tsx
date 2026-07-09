@@ -3691,8 +3691,8 @@ export default function App() {
                   <span className="font-mono font-semibold text-neutral-800"> AI_GATEWAY_API_KEY</span>.
                 </p>
                 <p>
-                  Modèle configurable via <span className="font-mono font-semibold text-neutral-800">AI_GATEWAY_MODEL</span>
-                  {' '}(défaut <span className="font-mono">openai/gpt-4o-mini</span>).
+                  Modèle haut de gamme avec bascule automatique (Claude Sonnet → GPT-4o).
+                  Épinglez-en un via <span className="font-mono font-semibold text-neutral-800">AI_GATEWAY_MODEL</span>.
                 </p>
                 <p className="text-neutral-500">
                   Sans clé configurée, l'app bascule automatiquement sur une simulation locale afin de rester fonctionnelle.

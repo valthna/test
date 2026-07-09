@@ -30,7 +30,11 @@ combat, coach, exercices, débrief, chat) passe par le **Vercel AI Gateway**.
 | Variable | Requis | Rôle |
 | --- | --- | --- |
 | `AI_GATEWAY_API_KEY` | oui | Clé créée dans l'onglet AI Gateway du projet Vercel |
-| `AI_GATEWAY_MODEL` | non | Modèle `créateur/modèle` (défaut `openai/gpt-4o-mini`) |
+| `AI_GATEWAY_MODEL` | non | Épingle un modèle `créateur/modèle`. Sinon bascule auto : `anthropic/claude-sonnet-4` → `claude-3.7-sonnet` → `claude-3.5-sonnet` → `openai/gpt-4o` → `openai/gpt-4o-mini` |
+
+> Le proxy n'envoie pas `response_format` (rejeté par le gateway pour plusieurs
+> modèles) : le JSON est imposé par le prompt puis extrait de façon robuste.
+> Diagnostic : `GET /api/llm?ping=1` (test live) ou `?selftest=1` (dossier complet).
 
 Après avoir ajouté/mis à jour les variables, redéploie pour qu'elles soient
 prises en compte. En local, copie `.env.example` vers `.env` (utilisé par

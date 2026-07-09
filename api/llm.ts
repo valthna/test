@@ -26,7 +26,27 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 export const config = { maxDuration: 30 };
 
 const GATEWAY_URL = 'https://ai-gateway.vercel.sh/v1/chat/completions';
-const DEFAULT_MODEL = process.env.AI_GATEWAY_MODEL || 'openai/gpt-4o-mini';
+
+// Prefer a high-quality model, but fall back automatically if a given slug
+// isn't available on the gateway (400/404) so the app never breaks. Set
+// AI_GATEWAY_MODEL to pin a specific model at the front of the list.
+const MODEL_CANDIDATES: string[] = Array.from(
+  new Set(
+    [
+      process.env.AI_GATEWAY_MODEL,
+      'anthropic/claude-sonnet-4',
+      'anthropic/claude-3.7-sonnet',
+      'anthropic/claude-3.5-sonnet',
+      'openai/gpt-4o',
+      'openai/gpt-4o-mini',
+    ].filter(Boolean) as string[]
+  )
+);
+
+// Cache the first model that actually answers (warm across invocations on the
+// same lambda instance) so we don't re-probe failing slugs on every request.
+let resolvedModel: string | null = null;
+const activeModel = () => resolvedModel || MODEL_CANDIDATES[0];
 
 const BASE_PERSONA =
   "Tu es Victor l'Éclaireur, un copilote d'entretien d'élite pour candidats en recherche d'emploi en France. " +
@@ -113,6 +133,33 @@ function buildContextBlock(context: any): string {
   return lines.length ? `\n\n=== CONTEXTE CANDIDAT ===\n${lines.join('\n')}` : '';
 }
 
+// Robustly pull a JSON value out of a model reply that may be wrapped in
+// ```json fences or surrounded by prose (since we no longer force json mode).
+export function extractJson(raw: string): any {
+  if (typeof raw !== 'string') throw new Error('empty');
+  let s = raw.trim();
+  // Strip Markdown code fences.
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  try {
+    return JSON.parse(s);
+  } catch {
+    // Fall back to the outermost {...} or [...] span.
+    const firstObj = s.indexOf('{');
+    const firstArr = s.indexOf('[');
+    let start = -1;
+    if (firstObj === -1) start = firstArr;
+    else if (firstArr === -1) start = firstObj;
+    else start = Math.min(firstObj, firstArr);
+    if (start === -1) throw new Error('no JSON found');
+    const openCh = s[start];
+    const closeCh = openCh === '{' ? '}' : ']';
+    const end = s.lastIndexOf(closeCh);
+    if (end <= start) throw new Error('no JSON span');
+    return JSON.parse(s.slice(start, end + 1));
+  }
+}
+
 export function unwrapArray(parsed: any): any {
   if (Array.isArray(parsed)) return parsed;
   if (parsed && typeof parsed === 'object') {
@@ -139,30 +186,49 @@ async function callGateway(
   apiKey: string,
   messages: Array<{ role: string; content: string }>,
   opts: { json?: boolean; maxTokens?: number; temperature?: number } = {}
-): Promise<{ ok: boolean; status: number; content: string; finishReason: string; error?: string }> {
-  const resp = await fetch(GATEWAY_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: DEFAULT_MODEL,
-      temperature: opts.temperature ?? (opts.json ? 0.5 : 0.7),
-      max_tokens: opts.maxTokens ?? 1600,
-      ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
-      messages,
-    }),
-  });
+): Promise<{ ok: boolean; status: number; content: string; finishReason: string; error?: string; model: string }> {
+  // Try the cached working model first, then the remaining candidates.
+  const order = resolvedModel
+    ? [resolvedModel, ...MODEL_CANDIDATES.filter((m) => m !== resolvedModel)]
+    : [...MODEL_CANDIDATES];
 
-  if (!resp.ok) {
+  let last = { ok: false, status: 0, content: '', finishReason: '', error: 'no model available', model: '' };
+
+  for (const model of order) {
+    const resp = await fetch(GATEWAY_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      // NOTE: we deliberately do NOT send `response_format`. The Vercel AI
+      // Gateway rejects it (400 invalid_request_error) for several models.
+      // JSON is enforced via the system prompt and extracted robustly instead.
+      body: JSON.stringify({
+        model,
+        temperature: opts.temperature ?? (opts.json ? 0.4 : 0.7),
+        max_tokens: opts.maxTokens ?? 1600,
+        messages,
+      }),
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      resolvedModel = model;
+      return {
+        ok: true,
+        status: 200,
+        content: data?.choices?.[0]?.message?.content ?? '',
+        finishReason: data?.choices?.[0]?.finish_reason ?? '',
+        model,
+      };
+    }
+
     const detail = await resp.text().catch(() => '');
-    return { ok: false, status: resp.status, content: '', finishReason: '', error: detail.slice(0, 600) };
+    last = { ok: false, status: resp.status, content: '', finishReason: '', error: detail.slice(0, 600), model };
+    // Only an unknown/unsupported model warrants trying the next candidate.
+    // Stop on auth (401/403), billing (402), rate limit (429) or 5xx.
+    if (resp.status !== 400 && resp.status !== 404) break;
+    console.error(`[llm] model ${model} -> ${resp.status}, trying next candidate`);
   }
-  const data = await resp.json();
-  return {
-    ok: true,
-    status: resp.status,
-    content: data?.choices?.[0]?.message?.content ?? '',
-    finishReason: data?.choices?.[0]?.finish_reason ?? '',
-  };
+  return last;
 }
 
 interface TaskBody {
@@ -228,11 +294,18 @@ async function executeTask(
   const userContent = prompt + buildContextBlock(body.context);
   const debug: any = opts.debug ? {} : undefined;
 
-  // One gateway round-trip + parse/normalize. Returns the parsed object (or null).
-  async function attempt(extraSystem?: string): Promise<
-    | { ok: true; text: string; parsed: any; raw: string; finish: string }
-    | { ok: false; status: number; error: string; detail: string; raw?: string }
-  > {
+  // One gateway round-trip + parse/normalize. Uniform (non-union) shape so the
+  // caller never depends on control-flow narrowing.
+  async function attempt(extraSystem?: string): Promise<{
+    ok: boolean;
+    status: number;
+    text: string;
+    parsed: any;
+    raw: string;
+    finish: string;
+    error: string;
+    detail: string;
+  }> {
     const sys = extraSystem ? `${systemParts.join('\n\n')}\n\n${extraSystem}` : systemParts.join('\n\n');
     const r = await callGateway(
       apiKey,
@@ -242,24 +315,25 @@ async function executeTask(
       ],
       { json: wantsJson, maxTokens: MAX_TOKENS[task] }
     );
+    if (debug) debug.model = r.model;
     if (!r.ok) {
       console.error(`[llm] task=${task} gateway ${r.status}: ${r.error}`);
-      return { ok: false, status: 502, error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) };
+      return { ok: false, status: 502, text: '', parsed: null, raw: '', finish: '', error: `Gateway error ${r.status}`, detail: (r.error || '').slice(0, 300) };
     }
     const raw = r.content;
-    console.log(`[llm] task=${task} finish=${r.finishReason} len=${raw.length}`);
+    console.log(`[llm] task=${task} model=${r.model} finish=${r.finishReason} len=${raw.length}`);
     if (r.finishReason === 'length') {
       console.error(`[llm] task=${task} truncated (max_tokens=${MAX_TOKENS[task] ?? 1600}).`);
-      return { ok: false, status: 502, error: 'Gateway response truncated', detail: `finish_reason=length len=${raw.length}`, raw };
+      return { ok: false, status: 502, text: '', parsed: null, raw, finish: 'length', error: 'Gateway response truncated', detail: `finish_reason=length len=${raw.length}` };
     }
-    if (!wantsJson) return { ok: true, text: raw, parsed: null, raw, finish: r.finishReason };
+    if (!wantsJson) return { ok: true, status: 200, text: raw, parsed: null, raw, finish: r.finishReason, error: '', detail: '' };
     try {
-      let parsed = JSON.parse(raw);
+      let parsed = extractJson(raw);
       parsed = task === 'linkedin_search' ? unwrapArray(parsed) : unwrapObject(parsed, task);
-      return { ok: true, text: JSON.stringify(parsed), parsed, raw, finish: r.finishReason };
+      return { ok: true, status: 200, text: JSON.stringify(parsed), parsed, raw, finish: r.finishReason, error: '', detail: '' };
     } catch {
       console.error(`[llm] task=${task} JSON parse failed`);
-      return { ok: false, status: 502, error: 'Gateway returned non-JSON', detail: raw.slice(0, 200), raw };
+      return { ok: false, status: 502, text: '', parsed: null, raw, finish: '', error: 'Gateway returned non-JSON', detail: raw.slice(0, 200) };
     }
   }
 
@@ -300,7 +374,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // Health / diagnostics.
   if (req.method === 'GET') {
-    const base = { ok: true, endpoint: 'llm', keyConfigured: !!apiKey, model: DEFAULT_MODEL };
+    const base = {
+      ok: true,
+      endpoint: 'llm',
+      keyConfigured: !!apiKey,
+      model: activeModel(),
+      modelCandidates: MODEL_CANDIDATES,
+      resolvedModel,
+    };
 
     // Full dossier pipeline self-test: proves structured output renders filled.
     if (req.query.selftest) {
@@ -355,7 +436,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
       res.status(200).json({
         ...base,
-        gateway: { tested: true, ok: r.ok, status: r.status, sample: (r.content || r.error || '').slice(0, 200), finishReason: r.finishReason },
+        resolvedModel,
+        gateway: { tested: true, ok: r.ok, status: r.status, model: r.model, sample: (r.content || r.error || '').slice(0, 200), finishReason: r.finishReason },
       });
     } catch (err: any) {
       res.status(200).json({ ...base, gateway: { tested: true, ok: false, error: String(err?.message || err).slice(0, 200) } });
